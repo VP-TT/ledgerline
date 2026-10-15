@@ -1,0 +1,25 @@
+name: ci
+on:
+  push:
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+      # unit tests + PostgreSQL integration tests (Testcontainers uses the runner's Docker)
+      - run: ./mvnw -B verify | tee build.log
+      - name: Test numbers
+        if: always()
+        run: grep -E '^\[(concurrency|property)\]' build.log || true
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: test-reports
+          path: '**/target/*-reports/'

@@ -1,0 +1,48 @@
+spring:
+  application.name: ledgerline
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/ledgerline}
+    username: ${DB_USER:ledgerline}
+    password: ${DB_PASSWORD:ledgerline}
+    hikari.maximum-pool-size: 30
+  flyway.enabled: true
+  threads.virtual.enabled: true
+  jackson:
+    default-property-inclusion: non_null
+    deserialization.use-big-decimal-for-floats: true
+
+server:
+  port: ${PORT:8080}
+  shutdown: graceful
+
+ledgerline:
+  gateway:
+    base-url: ${GATEWAY_URL:http://localhost:8090}
+    connect-timeout: 2s
+    read-timeout: 5s
+  outbox:
+    poll-interval: 500ms
+    batch-size: 50
+    max-attempts: 8
+    stuck-after: 5m
+    retry-base: 1s
+    retry-max: 5m
+  payments:
+    max-status-checks: 5          # 1s, 2s, 4s, 8s, 16s (+ jitter), then wait for reconciliation
+    status-check-base: 1s
+    status-check-max: 5m
+  rewards:
+    minor-per-point:
+      INR: 25                     # 1 point = Rs 0.25
+      USD: 1                      # 1 point = $0.01
+  idempotency:
+    lock-timeout: 2s
+  scheduling:
+    enabled: true
+
+management:
+  endpoints.web.exposure.include: health,info,prometheus,metrics
+  metrics.tags.application: ledgerline
+
+springdoc:
+  swagger-ui.path: /swagger-ui.html

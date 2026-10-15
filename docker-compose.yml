@@ -1,0 +1,26 @@
+services:
+  postgres:
+    image: postgres:16
+    environment: { POSTGRES_USER: ledgerline, POSTGRES_PASSWORD: ledgerline, POSTGRES_DB: ledgerline }
+    ports: ["5432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ledgerline"]
+      interval: 2s
+      retries: 30
+
+  fake-gateway:
+    build: { context: ., dockerfile: fake-gateway/Dockerfile }
+    ports: ["8090:8090"]
+
+  # `docker compose up -d postgres fake-gateway` + `./mvnw -pl service spring-boot:run` for development,
+  # or `docker compose --profile app up` to run everything in containers.
+  ledgerline:
+    profiles: [app]
+    build: { context: ., dockerfile: service/Dockerfile }
+    environment:
+      DB_URL: jdbc:postgresql://postgres:5432/ledgerline
+      GATEWAY_URL: http://fake-gateway:8090
+    ports: ["8080:8080"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      fake-gateway: { condition: service_started }
