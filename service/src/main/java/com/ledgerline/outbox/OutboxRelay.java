@@ -12,6 +12,7 @@ import java.util.Map;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.Executors;
 import java.util.function.Function;
 import java.util.stream.Collectors;
@@ -19,7 +20,8 @@ import java.util.stream.Collectors;
 /**
  * Drains the outbox: claims ready events, runs their handlers, then marks them DONE, reschedules them
  * with backoff, or marks them DEAD after {@code maxAttempts}. Events in a batch run in parallel on
- * virtual threads, since each one is independent and most of the time is spent waiting on the gateway.
+ * virtual threads (at most {@code concurrency} at a time), since each one is independent and most of
+ * the time is spent waiting on the gateway.
  */
 @Component
 public class OutboxRelay {
@@ -29,18 +31,29 @@ public class OutboxRelay {
   private final Map<String, OutboxHandler> handlers;
   private final LedgerlineProperties.Outbox config;
   private final ExecutorService workers = Executors.newVirtualThreadPerTaskExecutor();
+  /** Caps events in flight so the relay can't take the whole connection pool from the API. */
+  private final Semaphore permits;
 
   public OutboxRelay(OutboxRepository repo, List<OutboxHandler> handlers, LedgerlineProperties props) {
     this.repo = repo;
     this.handlers = handlers.stream().collect(Collectors.toMap(OutboxHandler::eventType, Function.identity()));
     this.config = props.outbox();
+    this.permits = new Semaphore(config.concurrency());
   }
 
   /** One pass: claim a batch and process it. Returns the number of events claimed. */
   public int drain() {
     List<OutboxEvent> batch = repo.claim(config.batchSize());
     if (batch.isEmpty()) return 0;
-    List<Callable<Void>> tasks = batch.stream().<Callable<Void>>map(e -> () -> { process(e); return null; }).toList();
+    List<Callable<Void>> tasks = batch.stream().<Callable<Void>>map(e -> () -> {
+      permits.acquire();
+      try {
+        process(e);
+      } finally {
+        permits.release();
+      }
+      return null;
+    }).toList();
     try {
       for (var f : workers.invokeAll(tasks)) f.get();
     } catch (InterruptedException e) {
@@ -49,6 +62,19 @@ public class OutboxRelay {
       log.error("outbox worker crashed", e.getCause());
     }
     return batch.size();
+  }
+
+  /**
+   * Drains back-to-back while batches come back full, so a backlog is worked off at full speed instead
+   * of one batch per poll interval. Returns once a batch is smaller than batchSize (the queue is caught up).
+   */
+  public int drainWhileBusy() {
+    int total = 0, n;
+    do {
+      n = drain();
+      total += n;
+    } while (n == config.batchSize() && !Thread.currentThread().isInterrupted());
+    return total;
   }
 
   void process(OutboxEvent e) {

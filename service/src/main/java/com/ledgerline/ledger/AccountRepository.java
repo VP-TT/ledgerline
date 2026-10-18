@@ -25,6 +25,14 @@ public class AccountRepository {
     return out;
   }
 
+  /** Plain read, no lock. Used for immutable facts (type, currency, allow_negative). */
+  public Map<UUID, Account> findAll(Collection<UUID> ids) {
+    Map<UUID, Account> out = new LinkedHashMap<>();
+    jdbc.sql("SELECT " + COLUMNS + " FROM accounts WHERE id IN (:ids)").param("ids", ids)
+        .query(Account.class).list().forEach(a -> out.put(a.id(), a));
+    return out;
+  }
+
   public void updateBalance(UUID id, long balance) {
     jdbc.sql("UPDATE accounts SET balance = :b, version = version + 1 WHERE id = :id")
         .param("b", balance).param("id", id).update();

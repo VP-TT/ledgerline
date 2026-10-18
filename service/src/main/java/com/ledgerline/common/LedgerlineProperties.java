@@ -11,8 +11,8 @@ public record LedgerlineProperties(Gateway gateway, Outbox outbox, Payments paym
 
   public record Gateway(String baseUrl, Duration connectTimeout, Duration readTimeout) {}
 
-  /** Relay settings. Failed handlers are retried with exponential backoff from retryBase up to retryMax. */
-  public record Outbox(Duration pollInterval, int batchSize, int maxAttempts, Duration stuckAfter,
+  /** Relay settings. {@code concurrency} caps events processed at once (each holds a DB connection at times). Failed handlers are retried with exponential backoff from retryBase up to retryMax. */
+  public record Outbox(Duration pollInterval, int batchSize, int concurrency, int maxAttempts, Duration stuckAfter,
                        Duration retryBase, Duration retryMax) {}
 
   /** Status checks for UNKNOWN payments: statusCheckBase × 2^n plus jitter, at most maxStatusChecks times. */

@@ -9,7 +9,7 @@ Java 21 · Spring Boot 3.3 · PostgreSQL 16 · Flyway · JdbcClient · ShedLock 
 | Threat | Mechanism |
 |---|---|
 | Client retries the same request | **Idempotency keys**: the key row, the work and the stored response commit in one transaction; a repeat replays the original bytes (`Idempotent-Replayed: true`), a repeat with a different body gets 422, a repeat while the first is still running gets 409 + `Retry-After` |
-| Two different requests spend the same balance | **Row-level locking**: `SELECT … FOR UPDATE` on every account an entry touches, always in account-id order (no deadlocks) |
+| Two different requests spend the same balance | **Row-level locking**: `SELECT … FOR UPDATE` on every account with a balance rule (wallets, points) an entry touches, always in account-id order (no deadlocks) |
 | Crash between "money moved" and "tell the gateway" | **Transactional outbox**: ledger entry and gateway event commit together; a relay (`FOR UPDATE SKIP LOCKED`) delivers at-least-once |
 | Gateway times out: did it charge or not? | **Payment state machine**: a timeout means UNKNOWN, never FAILED. We ask the gateway (status checks with exponential backoff + jitter), resubmit only on a confirmed "not found", and always send our payment id as the gateway's idempotency key |
 | Anything we missed | **Nightly reconciliation** against the gateway's settlement report, plus ledger self-checks |
@@ -85,7 +85,7 @@ Postings are signed minor units (debit = positive, credit = negative), so every 
 | Points accrued | `rewards_expense:PTS` | `rewards_points:{user}` |
 | Points redeemed | `rewards_points:{user}` (PTS) + `rewards_funding:INR` | `rewards_redeemed:PTS` + `user_wallet:{wallet}` |
 
-The cached `accounts.balance` is updated under the row lock in the same transaction; reconciliation re-derives it from postings.
+Accounts with a balance rule (user wallets and points) keep a cached `accounts.balance`, updated under their row lock in the same transaction. House accounts (cash, clearing, biller payables, rewards) have no rule to protect, so they are never locked: their balance is `SUM(postings)`. Locking them made every payment queue on one row (see [load test](docs/LOAD_TEST.md)). Reconciliation re-derives every balance from postings.
 
 ## API
 
@@ -149,24 +149,35 @@ From `./mvnw clean verify` on an Apple M1 Pro (8 cores), PostgreSQL 16 local, 15
 | Concurrency test time | 4.1 s to accept all 1,000 requests, 8.5 s until every payment reached a terminal state |
 | Property test | 200 sequences, 1,733 operations, 0 invariant violations |
 
-The concurrency test measures correctness under contention, not throughput: all 1,000 requests hit **one** wallet, so they serialize on its row lock by design. No load test has been run yet (see below).
+The concurrency test measures correctness under contention, not throughput: all 1,000 requests hit **one** wallet, so they serialize on its row lock by design.
+
+### Load test (k6)
+
+60 s at 200 payments/s over 200 wallets (≈12,000 payments), one instance, same laptop on battery, 16 Oct 2026. Full write-up: [docs/LOAD_TEST.md](docs/LOAD_TEST.md).
+
+| | p50 | p95 | p99 | settled after load stops |
+|---|---|---|---|---|
+| v1 | 28 ms | 1,392 ms | 3,026 ms | 125 s |
+| now (two runs) | 4.4 / 4.1 ms | 57 / 35 ms | 160 / 161 ms | 0.5 s |
+
+Sampling `pg_stat_activity` showed 552 of 593 active-session samples waiting on row locks: every payment was locking the shared `gateway_clearing` account. House accounts are no longer locked (they have no balance rule to protect), the outbox relay drains back-to-back instead of one batch per poll, and its concurrency is capped so it can't starve the API of connections. 0 failed requests in every run. Not yet measured: rates above 200/s, multiple instances, gateway faults under load.
 
 ## Design decisions
 
 - **Idempotency in one transaction.** The key is inserted IN_PROGRESS, the work runs, and the key is marked COMPLETED in the same READ COMMITTED transaction, so other transactions only ever see completed keys. A concurrent duplicate blocks on the primary key and then replays (or runs, if the first rolled back); `lock_timeout` turns a long wait into 409. Business failures aren't cached, so retrying after a top-up works. The stored response is replayed byte-for-byte.
-- **All account locks in one sorted batch.** `LedgerService.postAll` locks the union of accounts across every entry in a transaction, in id order. Locking per entry (or pre-locking the wallet, then letting the ledger lock clearing) can deadlock against the reversal path.
+- **All account locks in one sorted batch, and only where there's a rule.** `LedgerService.postAll` locks the union of rule-bearing accounts across every entry in a transaction, in id order. Locking per entry (or pre-locking the wallet, then letting the ledger lock clearing) can deadlock against the reversal path. House accounts aren't locked at all: there's no balance check to protect, and locking them serialized every payment (found by the load test).
 - **Retries live in the database, not in memory.** Status checks and resubmits are outbox events with `available_at`, so a restart loses nothing. That's why there's no Resilience4j retry: an in-process retry on top would double-retry and vanish on crash.
 - **Timeouts are UNKNOWN; only a confirmed decline moves money back.** Funds that may have been charged are never auto-reversed.
 - **Explicit SQL everywhere** (Spring JdbcClient, no JPA), because the locking and compare-and-set semantics should be visible.
-- **READ COMMITTED + explicit row locks** rather than SERIALIZABLE: the few hot rows are locked on purpose, so there are no serialization failures to retry. SERIALIZABLE would also be correct, at the price of retry loops.
+- **READ COMMITTED + explicit row locks** rather than SERIALIZABLE: the rows that carry a balance rule are locked on purpose, so there are no serialization failures to retry. SERIALIZABLE would also be correct, at the price of retry loops.
 - **Reconciliation window:** payments created on day D plus any payment the gateway's report for D mentions, compared against the gateway's reports for D and D+1 (a charge for a 23:59 payment can land after midnight). It reports and flags; it never moves money.
 
 ## Known limitations / next steps
 
-- `gateway_clearing:{currency}` is a single hot row that every payment locks; at scale, shard it into N clearing accounts.
 - No authentication: `X-Client-Id` stands in for an authenticated client.
 - Points clawback isn't implemented: in v1 a payment can only be reversed before it succeeds, so points (accrued on success) never need clawing back. It becomes necessary with refunds.
-- Not yet done: a k6/Gatling load test for throughput and p95/p99, gateway webhooks with HMAC verification, Debezium CDC instead of a polling outbox, scheduled/recurring payments.
+- Load tested on one laptop at 200/s only; no multi-instance or higher-rate numbers yet.
+- Not yet done: gateway webhooks with HMAC verification, Debezium CDC instead of a polling outbox, scheduled/recurring payments.
 
 ## Layout
 
@@ -180,6 +191,7 @@ service/src/main/java/com/ledgerline/
   rewards/         accrual rules, redemption
   reconciliation/  Reconciler (pure), integrity checks, nightly job, admin API
   wallet/, biller/, common/
-service/src/main/resources/db/migration/   V1 ledger … V5 reconciliation
+service/src/main/resources/db/migration/   V1 ledger … V6 unlocked house accounts
 fake-gateway/      controllable payment gateway (JDK HttpServer)
+loadtest/          k6 script (docs/LOAD_TEST.md has the results)
 ```

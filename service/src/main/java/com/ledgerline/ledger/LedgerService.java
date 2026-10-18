@@ -36,8 +36,14 @@ public class LedgerService {
   }
 
   /**
-   * Posts several entries atomically. All accounts touched by any entry are locked up front, in id
-   * order: locking per entry would let two transactions grab overlapping accounts in different orders.
+   * Posts several entries atomically.
+   *
+   * <p>Only accounts with a balance rule ({@code allow_negative = false}: user wallets and points) are
+   * locked and have their cached balance updated, because only they need a read-check-write. They are
+   * all locked up front, in id order, so two transactions never grab overlapping accounts in opposite
+   * orders. House accounts (cash, clearing, biller payables, rewards) have no rule to protect: their
+   * postings are appended without a lock and their balance is SUM(postings). Locking them made every
+   * payment in the system queue on one gateway_clearing row (see docs/LOAD_TEST.md).
    */
   @Transactional(propagation = Propagation.MANDATORY)
   public List<UUID> postAll(List<EntryRequest> entries) {
@@ -45,21 +51,28 @@ public class LedgerService {
 
     List<UUID> ids = entries.stream().flatMap(e -> e.postings().stream()).map(Posting::accountId)
         .distinct().sorted().toList();
-    Map<UUID, Account> locked = accounts.lockAllForUpdate(ids);
-    if (locked.size() != ids.size()) throw new IllegalArgumentException("unknown account in " + ids);
+    Map<UUID, Account> all = accounts.findAll(ids);
+    if (all.size() != ids.size()) throw new IllegalArgumentException("unknown account in " + ids);
+    for (EntryRequest e : entries) {
+      for (Posting p : e.postings()) {
+        Account a = all.get(p.accountId());
+        if (!a.currency().equals(p.currency()))
+          throw new IllegalArgumentException("posting in " + p.currency() + " to " + a.code());
+      }
+    }
 
+    List<UUID> constrained = ids.stream().filter(id -> !all.get(id).allowNegative()).toList();
+    Map<UUID, Account> locked = constrained.isEmpty() ? Map.of() : accounts.lockAllForUpdate(constrained);
     Map<UUID, Long> balances = new HashMap<>();
     for (EntryRequest e : entries) {
       for (Posting p : e.postings()) {
         Account a = locked.get(p.accountId());
-        if (!a.currency().equals(p.currency()))
-          throw new IllegalArgumentException("posting in " + p.currency() + " to " + a.code());
-        balances.merge(a.id(), a.balance() + p.amount(), (old, ignored) -> old + p.amount());
+        if (a != null) balances.merge(a.id(), a.balance() + p.amount(), (old, ignored) -> old + p.amount());
       }
     }
     for (var b : balances.entrySet()) {
       Account a = locked.get(b.getKey());
-      if (!a.allowNegative() && a.wrongSide(b.getValue())) throw new InsufficientFundsException(a);
+      if (a.wrongSide(b.getValue())) throw new InsufficientFundsException(a);
     }
     balances.forEach(accounts::updateBalance);
 

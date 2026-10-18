@@ -2,6 +2,11 @@ package com.ledgerline.ledger;
 
 import java.util.UUID;
 
+/**
+ * {@code balance} is a cached SUM(postings), maintained under a row lock, only for accounts with a
+ * balance rule ({@code allowNegative = false}). House accounts ({@code allowNegative = true}) keep 0
+ * there and are summed from postings when needed.
+ */
 public record Account(UUID id, String code, AccountType type, String currency, long balance,
                       boolean allowNegative, boolean system) {
 

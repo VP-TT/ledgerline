@@ -26,17 +26,19 @@ public class LedgerIntegrityChecker {
     jdbc.sql("""
         SELECT a.code || ': cached ' || a.balance || ', postings ' || COALESCE(SUM(p.amount), 0)
         FROM accounts a LEFT JOIN postings p ON p.account_id = a.id
+        WHERE NOT a.allow_negative                 -- only these keep a cached balance
         GROUP BY a.id HAVING a.balance <> COALESCE(SUM(p.amount), 0)""")
         .query(String.class).list()
         .forEach(n -> out.add(Mismatch.integrity(MismatchType.BALANCE_DRIFT, n)));
 
-    // clearing is a liability (credit-normal), so money in flight shows as a negative balance
+    // clearing is a liability (credit-normal), so money in flight shows as a negative sum of postings
     jdbc.sql("""
-        SELECT a.code || ': holds ' || (-a.balance) || ', in-flight payments ' || COALESCE(f.total, 0)
+        SELECT a.code || ': holds ' || COALESCE(-c.total, 0) || ', in-flight payments ' || COALESCE(f.total, 0)
         FROM accounts a
+        LEFT JOIN (SELECT account_id, SUM(amount) AS total FROM postings GROUP BY account_id) c ON c.account_id = a.id
         LEFT JOIN (SELECT currency, SUM(amount) AS total FROM payments
                    WHERE status IN (:inflight) GROUP BY currency) f ON f.currency = a.currency
-        WHERE a.code LIKE 'gateway_clearing:%' AND -a.balance <> COALESCE(f.total, 0)""")
+        WHERE a.code LIKE 'gateway_clearing:%' AND COALESCE(-c.total, 0) <> COALESCE(f.total, 0)""")
         .param("inflight", PaymentStatus.IN_FLIGHT.stream().map(Enum::name).toList())
         .query(String.class).list()
         .forEach(n -> out.add(Mismatch.integrity(MismatchType.CLEARING_DRIFT, n)));

@@ -64,8 +64,9 @@ class ReconciliationIT extends IntegrationTest {
 
   @Test
   void integrityCheckCatchesBalanceDrift() {
-    api.walletWithBalance("INR", "100.00");
-    jdbc.sql("UPDATE accounts SET balance = balance - 1 WHERE code = 'cash_bank:INR'").update();  // simulate a bug
+    var wallet = api.walletWithBalance("INR", "100.00");
+    jdbc.sql("UPDATE accounts SET balance = balance - 1 WHERE code = :c").param("c", "user_wallet:" + wallet)
+        .update();  // simulate a bug
     var run = api.post("/v1/admin/reconciliation/runs?date=" + today, null, java.util.Map.of());
     var report = api.get("/v1/admin/reconciliation/runs/" + today).body().path("mismatches");
     assertThat(run.text("status")).isEqualTo("ATTENTION");

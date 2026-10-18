@@ -23,6 +23,7 @@ ledgerline:
   outbox:
     poll-interval: 500ms
     batch-size: 50
+    concurrency: 10               # events in flight at once; keeps the relay from starving the API of connections
     max-attempts: 8
     stuck-after: 5m
     retry-base: 1s

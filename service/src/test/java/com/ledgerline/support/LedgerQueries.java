@@ -21,10 +21,13 @@ public final class LedgerQueries {
     return jdbc.sql("SELECT currency FROM postings GROUP BY currency HAVING SUM(amount) <> 0").query(String.class).list();
   }
 
+  /** Rule-bearing accounts' cached balance must equal their postings; house accounts must keep 0 cached. */
   public List<String> accountsWhereCachedBalanceDiffersFromPostings() {
     return jdbc.sql("""
         SELECT a.code FROM accounts a LEFT JOIN postings p ON p.account_id = a.id
-        GROUP BY a.id HAVING a.balance <> COALESCE(SUM(p.amount), 0)""").query(String.class).list();
+        GROUP BY a.id
+        HAVING a.balance <> CASE WHEN a.allow_negative THEN 0 ELSE COALESCE(SUM(p.amount), 0) END""")
+        .query(String.class).list();
   }
 
   /** User wallets and points are liabilities: a positive (debit) balance means the user went below zero. */
@@ -38,10 +41,11 @@ public final class LedgerQueries {
   public List<String> clearingDrift() {
     return jdbc.sql("""
         SELECT a.code FROM accounts a
+        LEFT JOIN (SELECT account_id, SUM(amount) t FROM postings GROUP BY account_id) c ON c.account_id = a.id
         LEFT JOIN (SELECT currency, SUM(amount) t FROM payments
                    WHERE status IN ('PENDING','SUBMITTED','UNKNOWN','FAILED') GROUP BY currency) f
           ON f.currency = a.currency
-        WHERE a.code LIKE 'gateway_clearing:%' AND -a.balance <> COALESCE(f.t, 0)""").query(String.class).list();
+        WHERE a.code LIKE 'gateway_clearing:%' AND COALESCE(-c.t, 0) <> COALESCE(f.t, 0)""").query(String.class).list();
   }
 
   public long entries(String type, UUID reference) {

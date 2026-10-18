@@ -44,7 +44,7 @@ public class SchedulingConfig implements SchedulingConfigurer {
 
   @Override
   public void configureTasks(ScheduledTaskRegistrar tasks) {
-    tasks.addFixedDelayTask(relay::drain, props.outbox().pollInterval());
+    tasks.addFixedDelayTask(relay::drainWhileBusy, props.outbox().pollInterval());
     tasks.addFixedDelayTask(relay::sweepStuck, Duration.ofMinutes(1));
     tasks.addFixedDelayTask(metrics::refresh, Duration.ofSeconds(15));
   }
