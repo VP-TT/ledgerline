@@ -59,6 +59,7 @@ public final class TestEnv {
     p.put("ledgerline.scheduling.enabled", "false");            // tests drive the relay themselves
     p.put("ledgerline.gateway.base-url", gateway().baseUrl());
     p.put("ledgerline.gateway.read-timeout", "300ms");
+    p.put("ledgerline.gateway.webhook-secret", WEBHOOK_SECRET);
     p.put("ledgerline.payments.status-check-base", "20ms");
     p.put("ledgerline.payments.status-check-max", "200ms");
     p.put("ledgerline.outbox.retry-base", "10ms");
@@ -66,6 +67,8 @@ public final class TestEnv {
     p.put("logging.level.com.ledgerline", "WARN");
     return p;
   }
+
+  public static final String WEBHOOK_SECRET = "test-webhook-secret";
 
   /** Gateway delay used by timeout modes: comfortably past the 300 ms read timeout. */
   public static final long GATEWAY_DELAY_MS = 450;

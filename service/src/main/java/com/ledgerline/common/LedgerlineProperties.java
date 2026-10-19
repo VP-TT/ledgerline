@@ -9,7 +9,9 @@ import java.util.Map;
 public record LedgerlineProperties(Gateway gateway, Outbox outbox, Payments payments, Rewards rewards,
                                    Idempotency idempotency, Scheduling scheduling) {
 
-  public record Gateway(String baseUrl, Duration connectTimeout, Duration readTimeout) {}
+  /** {@code webhookSecret} signs gateway → us webhooks; signatures older than {@code webhookTolerance} are rejected. */
+  public record Gateway(String baseUrl, Duration connectTimeout, Duration readTimeout, String webhookSecret,
+                        Duration webhookTolerance) {}
 
   /** Relay settings. {@code concurrency} caps events processed at once (each holds a DB connection at times). Failed handlers are retried with exponential backoff from retryBase up to retryMax. */
   public record Outbox(Duration pollInterval, int batchSize, int concurrency, int maxAttempts, Duration stuckAfter,

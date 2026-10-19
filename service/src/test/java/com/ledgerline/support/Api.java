@@ -51,6 +51,14 @@ public final class Api {
     }
   }
 
+  /** POST with an exact body and custom headers (webhooks: the signature covers the raw bytes). */
+  public Response postRaw(String path, String body, Map<String, String> headers) {
+    var req = HttpRequest.newBuilder(URI.create(base + path)).header("Content-Type", "application/json")
+        .timeout(Duration.ofSeconds(30)).POST(HttpRequest.BodyPublishers.ofString(body));
+    headers.forEach(req::header);
+    return send(req.build());
+  }
+
   /** POST that retries 409 "in progress" the way a well-behaved client would. */
   public Response postRetrying(String path, String key, Object body) {
     for (int i = 0; ; i++) {

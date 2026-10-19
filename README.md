@@ -12,6 +12,7 @@ Java 21 · Spring Boot 3.3 · PostgreSQL 16 · Flyway · JdbcClient · ShedLock 
 | Two different requests spend the same balance | **Row-level locking**: `SELECT … FOR UPDATE` on every account with a balance rule (wallets, points) an entry touches, always in account-id order (no deadlocks) |
 | Crash between "money moved" and "tell the gateway" | **Transactional outbox**: ledger entry and gateway event commit together; a relay (`FOR UPDATE SKIP LOCKED`) delivers at-least-once |
 | Gateway times out: did it charge or not? | **Payment state machine**: a timeout means UNKNOWN, never FAILED. We ask the gateway (status checks with exponential backoff + jitter), resubmit only on a confirmed "not found", and always send our payment id as the gateway's idempotency key |
+| Gateway pushes the outcome (webhooks) | **Signed, deduplicated webhooks**: HMAC-SHA256 over timestamp + raw body, constant-time compare, 5-minute replay window; the gateway's event id is recorded in the same transaction as the transition it causes, after locking the payment row, so redeliveries and races with the relay or status checks apply once |
 | Anything we missed | **Nightly reconciliation** against the gateway's settlement report, plus ledger self-checks |
 | Bugs in our own code | **Double-entry ledger** enforced by the database: a deferred trigger rejects any journal entry that doesn't sum to zero per currency, and ledger tables are append-only |
 
@@ -29,6 +30,7 @@ flowchart LR
   R[Outbox relay<br/>SKIP LOCKED] -->|claims| O
   R --> SM[Payment state machine]
   SM -->|POST /charges<br/>Idempotency-Key = payment id| G[Payment gateway]
+  G -.->|signed webhook<br/>charge.approved / declined| SM
   SM -->|settle / reverse + rewards| L
   N[Nightly reconciliation<br/>ShedLock] -->|GET /settlements| G
   N --> L
@@ -100,6 +102,7 @@ All writes need `X-Client-Id` (scopes idempotency keys) and `Idempotency-Key`. E
 | `GET /v1/payments/{id}` | Payment status |
 | `GET /v1/wallets/{id}/balance`, `/transactions` | Balance, points, ledger history |
 | `POST /v1/rewards/redeem` | Redeem points `{walletId, points}` |
+| `POST /v1/webhooks/gateway` | Gateway → us: `charge.approved` / `charge.declined`, `Gateway-Signature: t=…,v1=…` |
 | `POST /v1/admin/reconciliation/runs?date=` · `GET …/runs/{date}` | Run / read a reconciliation |
 | `GET /v1/admin/outbox` | Outbox backlog |
 
@@ -122,7 +125,7 @@ curl -s localhost:8080/v1/payments -H 'Content-Type: application/json' -H 'X-Cli
   "accountRef":"TS-123456","amount":500.00,"currency":"INR"}'
 ```
 
-The **fake gateway** (`fake-gateway/`, plain JDK HTTP server) honours `Idempotency-Key` and can be told to misbehave, globally via `POST /_control/config` (rates for decline / charge-then-timeout / drop / 5xx, a delay, status-check outages) or per request with `?mode=timeout_then_succeed` etc.
+The **fake gateway** (`fake-gateway/`, plain JDK HTTP server) honours `Idempotency-Key` and can be told to misbehave, globally via `POST /_control/config` (rates for decline / charge-then-timeout / drop / 5xx, a delay, status-check outages) or per request with `?mode=timeout_then_succeed` etc. With `WEBHOOK_URL` / `WEBHOOK_SECRET` set (or `POST /_control/webhooks`) it also pushes signed webhooks, optionally delayed or delivered several times.
 
 ## Tests
 
@@ -135,6 +138,7 @@ Integration tests run against real PostgreSQL (H2 doesn't lock like Postgres), t
 
 - **Property test** (`LedgerPropertiesIT`, jqwik): random sequences of up to 40 operations (top-ups, INR/USD payments, gateway outcomes, redemptions, retries of the previous request) across 200 tries. After each sequence: every entry balances, each currency sums to zero, cached balances equal postings, no wallet or points balance below zero, `gateway_clearing` equals money in flight, one entry per business event, every SUCCEEDED payment was charged, nothing REVERSED was charged. Each try starts from an empty ledger and gateway outcomes are deterministic, so a failure shrinks to the sequence that caused it. (Checked by planting a bug that skips the reversal entry: the property fails and shrinks to a sequence ending in `ResolvePayments[mode=DECLINE]`.)
 - **Concurrency test** (`ConcurrencyIT`): 1,000 simultaneous payment requests against one wallet that can afford 600, using 700 distinct keys (300 duplicates), with the gateway timing out on ~10% of submits (half after charging, half without).
+- **Webhooks** (`WebhookIT`, `WebhookVerifierTest`): charged-then-timeout resolved by the webhook with zero status-check calls; 20 payments with every webhook delivered 3 times while racing the relay: one settlement each, one event row each; decline webhook reverses an UNKNOWN payment; wrong amount isn't applied; forged, replayed (old timestamp), unsigned and timestamp-swapped signatures rejected.
 - **Failure-mode tests** (`PaymentFlowIT`): decline → reversal; charged-then-timeout → status check settles once; lost request → resubmit with same key; 5xx → UNKNOWN, money stays reserved; status checks exhausted → stays UNKNOWN; relay crash after the gateway call → redelivered, charged once, settled once; worker dies mid-event → sweeper; poison event → DEAD after 8 attempts.
 - Also: idempotency (replay, 422 on reuse, 409 + `Retry-After` while in progress, failures not cached), state-machine races (8 threads, exactly one wins), every legal/illegal transition, rewards and redemption, table-driven `Reconciler.compare` for every mismatch type, DB-level balance and append-only enforcement.
 
@@ -144,7 +148,7 @@ From `./mvnw clean verify` on an Apple M1 Pro (8 cores), PostgreSQL 16 local, 15
 
 | | |
 |---|---|
-| Tests | 103 passing (58 unit, 5 fake-gateway, 40 integration) |
+| Tests | 116 passing (64 unit, 6 fake-gateway, 46 integration) as of 18 Oct 2026 |
 | Concurrency test | 1,000 requests → 900 × 202 (300 of them replays), 100 × 422 insufficient funds; **600 distinct payments, 600 gateway charges, 0 double charges**; 617 gateway submits, 41 payments went UNKNOWN and were resolved by status checks; wallet ends at exactly 0.00 |
 | Concurrency test time | 4.1 s to accept all 1,000 requests, 8.5 s until every payment reached a terminal state |
 | Property test | 200 sequences, 1,733 operations, 0 invariant violations |
@@ -177,7 +181,8 @@ Sampling `pg_stat_activity` showed 552 of 593 active-session samples waiting on 
 - No authentication: `X-Client-Id` stands in for an authenticated client.
 - Points clawback isn't implemented: in v1 a payment can only be reversed before it succeeds, so points (accrued on success) never need clawing back. It becomes necessary with refunds.
 - Load tested on one laptop at 200/s only; no multi-instance or higher-rate numbers yet.
-- Not yet done: gateway webhooks with HMAC verification, Debezium CDC instead of a polling outbox, scheduled/recurring payments.
+- Webhook secret is a single shared secret; rotation would need two active secrets at once.
+- Not yet done: Debezium CDC instead of a polling outbox, scheduled/recurring payments.
 
 ## Layout
 
@@ -191,7 +196,7 @@ service/src/main/java/com/ledgerline/
   rewards/         accrual rules, redemption
   reconciliation/  Reconciler (pure), integrity checks, nightly job, admin API
   wallet/, biller/, common/
-service/src/main/resources/db/migration/   V1 ledger … V6 unlocked house accounts
+service/src/main/resources/db/migration/   V1 ledger … V7 gateway webhooks
 fake-gateway/      controllable payment gateway (JDK HttpServer)
 loadtest/          k6 script (docs/LOAD_TEST.md has the results)
 ```

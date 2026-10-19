@@ -11,6 +11,10 @@ services:
   fake-gateway:
     build: { context: ., dockerfile: fake-gateway/Dockerfile }
     ports: ["8090:8090"]
+    environment:
+      # webhooks go to the containerized app; with spring-boot:run use http://host.docker.internal:8080/...
+      WEBHOOK_URL: http://ledgerline:8080/v1/webhooks/gateway
+      WEBHOOK_SECRET: dev-webhook-secret
 
   # `docker compose up -d postgres fake-gateway` + `./mvnw -pl service spring-boot:run` for development,
   # or `docker compose --profile app up` to run everything in containers.
@@ -20,6 +24,7 @@ services:
     environment:
       DB_URL: jdbc:postgresql://postgres:5432/ledgerline
       GATEWAY_URL: http://fake-gateway:8090
+      GATEWAY_WEBHOOK_SECRET: dev-webhook-secret
     ports: ["8080:8080"]
     depends_on:
       postgres: { condition: service_healthy }

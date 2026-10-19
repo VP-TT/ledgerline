@@ -45,7 +45,7 @@ class FakeGatewayTest {
     var second = charge("p1", "", Duration.ofSeconds(2));
     assertThat(first.statusCode()).isEqualTo(200);
     assertThat(second.body()).isEqualTo(first.body());
-    assertThat(gw.stats()).isEqualTo(new FakeGateway.Stats(2, 1, 1, 0, 1));
+    assertThat(gw.stats()).isEqualTo(new FakeGateway.Stats(2, 1, 1, 0, 1, 0, 0));
   }
 
   @Test void declineIsRecordedAndSticky() throws Exception {
@@ -65,6 +65,33 @@ class FakeGatewayTest {
     assertThatThrownBy(() -> charge("p4", "", Duration.ofMillis(100))).isInstanceOf(HttpTimeoutException.class);
     Thread.sleep(400);
     assertThat(get("/charges/p4").statusCode()).isEqualTo(404);
+  }
+
+  @Test void webhooksAreSignedAndRedeliveriesKeepTheEventId() throws Exception {
+    var received = new java.util.concurrent.CopyOnWriteArrayList<String[]>();
+    var receiver = com.sun.net.httpserver.HttpServer.create(new java.net.InetSocketAddress(0), 0);
+    receiver.createContext("/hook", ex -> {
+      received.add(new String[] {ex.getRequestHeaders().getFirst("Gateway-Signature"),
+          new String(ex.getRequestBody().readAllBytes(), java.nio.charset.StandardCharsets.UTF_8)});
+      ex.sendResponseHeaders(200, -1);
+      ex.close();
+    });
+    receiver.start();
+    try {
+      gw.configureWebhooks(new FakeGateway.Webhooks(
+          "http://localhost:" + receiver.getAddress().getPort() + "/hook", "secret", 0, 2));
+      charge("p6", "", Duration.ofSeconds(2));
+      for (int i = 0; i < 100 && received.size() < 2; i++) Thread.sleep(20);
+
+      assertThat(received).hasSize(2);
+      assertThat(received.get(0)[1]).isEqualTo(received.get(1)[1]).contains("\"type\":\"charge.approved\"");
+      String sig = received.get(0)[0];
+      String t = sig.substring(2, sig.indexOf(','));
+      assertThat(sig).endsWith("v1=" + FakeGateway.sign("secret", t + "." + received.get(0)[1]));
+      assertThat(gw.stats().webhooksSent()).isEqualTo(2);
+    } finally {
+      receiver.stop(0);
+    }
   }
 
   @Test void settlementReportListsTodaysCharges() throws Exception {

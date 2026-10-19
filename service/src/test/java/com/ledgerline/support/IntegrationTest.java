@@ -41,6 +41,21 @@ public abstract class IntegrationTest {
     ledger = new LedgerQueries(jdbc);
   }
 
+  /** Points the fake gateway's webhooks at this app. */
+  protected void enableWebhooks(long delayMs, int deliveries) {
+    gateway.configureWebhooks(new FakeGateway.Webhooks("http://localhost:" + port + "/v1/webhooks/gateway",
+        TestEnv.WEBHOOK_SECRET, delayMs, deliveries));
+  }
+
+  /** Polls until the condition holds (webhooks arrive asynchronously). */
+  protected void await(String what, java.util.function.BooleanSupplier condition) {
+    long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
+    while (!condition.getAsBoolean()) {
+      if (System.nanoTime() > deadline) throw new AssertionError("timed out waiting for " + what);
+      try { Thread.sleep(20); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+    }
+  }
+
   protected void settle() {
     assertThat(relay.drainUntilIdle(Duration.ofSeconds(60))).as("outbox drained").isTrue();
   }

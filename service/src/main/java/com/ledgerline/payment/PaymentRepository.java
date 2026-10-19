@@ -29,6 +29,11 @@ public class PaymentRepository {
         .orElseThrow(() -> new ApiException.NotFound("Payment", id));
   }
 
+  /** Locks the payment row, so no other transition can interleave until this transaction ends. */
+  public java.util.Optional<Payment> findForUpdate(UUID id) {
+    return jdbc.sql("SELECT * FROM payments WHERE id = :id FOR UPDATE").param("id", id).query(Payment.class).optional();
+  }
+
   public List<Payment> findAll(Collection<UUID> ids) {
     if (ids.isEmpty()) return List.of();
     return jdbc.sql("SELECT * FROM payments WHERE id IN (:ids)").param("ids", ids).query(Payment.class).list();

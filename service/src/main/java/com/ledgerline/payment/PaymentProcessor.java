@@ -4,7 +4,9 @@ import com.ledgerline.biller.Biller;
 import com.ledgerline.biller.BillerRepository;
 import com.ledgerline.common.Backoff;
 import com.ledgerline.common.LedgerlineProperties;
+import com.ledgerline.gateway.GatewayCharge;
 import com.ledgerline.gateway.GatewayClient;
+import com.ledgerline.gateway.WebhookEvent;
 import com.ledgerline.gateway.StatusOutcome;
 import com.ledgerline.gateway.SubmitOutcome;
 import com.ledgerline.ledger.EntryRequest;
@@ -18,6 +20,7 @@ import com.ledgerline.wallet.WalletRepository;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -26,6 +29,7 @@ import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 
 import static com.ledgerline.payment.PaymentStatus.*;
@@ -53,11 +57,13 @@ public class PaymentProcessor {
   private final MeterRegistry metrics;
   private final LedgerlineProperties.Payments config;
   private final TransactionTemplate tx;
+  private final JdbcClient jdbc;
 
   public PaymentProcessor(PaymentRepository payments, WalletRepository wallets, BillerRepository billers,
                           LedgerService ledger, SystemAccounts system, RewardsService rewards,
                           OutboxRepository outbox, GatewayClient gateway, PaymentFaults faults,
-                          MeterRegistry metrics, LedgerlineProperties props, PlatformTransactionManager txm) {
+                          MeterRegistry metrics, LedgerlineProperties props, PlatformTransactionManager txm,
+                          JdbcClient jdbc) {
     this.payments = payments;
     this.wallets = wallets;
     this.billers = billers;
@@ -70,6 +76,7 @@ public class PaymentProcessor {
     this.metrics = metrics;
     this.config = props.payments();
     this.tx = new TransactionTemplate(txm);
+    this.jdbc = jdbc;
   }
 
   /** Handles PAYMENT_SUBMIT_REQUESTED. Safe to run again: a resubmit reuses the payment id as the gateway key. */
@@ -88,7 +95,7 @@ public class PaymentProcessor {
     faults.afterGatewayCall(id);
 
     tx.executeWithoutResult(s -> {
-      Payment cur = payments.get(id);
+      Payment cur = payments.findForUpdate(id).orElseThrow();   // a webhook may be resolving it right now
       if (cur.status() != SUBMITTED) return;
       switch (outcome) {
         case SubmitOutcome.Approved a -> succeed(cur, a.chargeId());
@@ -108,17 +115,11 @@ public class PaymentProcessor {
     StatusOutcome outcome = gateway.status(id);
 
     tx.executeWithoutResult(s -> {
-      Payment cur = payments.get(id);
+      Payment cur = payments.findForUpdate(id).orElseThrow();
       if (cur.status() != UNKNOWN) return;
       int checks = payments.incrementStatusChecks(id);
       switch (outcome) {
-        case StatusOutcome.Found f when f.charge().amount() != cur.amount() -> {
-          log.error("payment {}: gateway charged {} but we sent {}; leaving UNKNOWN for reconciliation",
-              id, f.charge().amount(), cur.amount());
-          metrics.counter("ledgerline.payments.awaiting_reconciliation").increment();
-        }
-        case StatusOutcome.Found f when f.charge().approved() -> succeed(cur, f.charge().chargeId());
-        case StatusOutcome.Found f -> failAndReverse(cur, f.charge().chargeId(), "declined: " + f.charge().declineReason());
+        case StatusOutcome.Found f -> applyCharge(cur, f.charge());
         case StatusOutcome.NotFound n -> {
           // the gateway never saw it: resubmit with the same key (a late original is deduped by the gateway)
           move(cur, SUBMITTED, null, null);
@@ -131,6 +132,59 @@ public class PaymentProcessor {
         case StatusOutcome.Unknown u -> scheduleStatusCheck(id, checks);
       }
     });
+  }
+
+  /**
+   * Handles a signed gateway webhook. The event id is recorded in the same transaction as the
+   * transition it causes, and the payment row is locked first, so neither a redelivery nor a racing
+   * status check or relay response can apply an outcome twice. Returns what happened.
+   */
+  public String onWebhook(WebhookEvent event, String payload) {
+    return tx.execute(s -> {
+      int fresh = jdbc.sql("""
+          INSERT INTO gateway_webhook_events (event_id, type, payment_id, outcome, payload)
+          VALUES (:id, :type, :pid, 'RECEIVED', :payload) ON CONFLICT (event_id) DO NOTHING""")
+          .param("id", event.eventId()).param("type", String.valueOf(event.type()))
+          .param("pid", event.charge().paymentId()).param("payload", payload).update();
+      if (fresh == 0) return "DUPLICATE";
+
+      String outcome;
+      Optional<Payment> payment = parseUuid(event.charge().paymentId()).flatMap(payments::findForUpdate);
+      if (payment.isEmpty()) {
+        log.warn("webhook {} for unknown payment {}; reconciliation will flag the charge", event.eventId(),
+            event.charge().paymentId());
+        outcome = "UNKNOWN_PAYMENT";
+      } else if (payment.get().status() == SUBMITTED || payment.get().status() == UNKNOWN) {
+        outcome = applyCharge(payment.get(), event.charge());
+      } else {
+        outcome = "IGNORED_" + payment.get().status();     // already resolved (or not sent yet)
+      }
+      jdbc.sql("UPDATE gateway_webhook_events SET outcome = :o WHERE event_id = :id")
+          .param("o", outcome).param("id", event.eventId()).update();
+      metrics.counter("ledgerline.gateway.webhooks", "outcome", outcome.startsWith("IGNORED") ? "IGNORED" : outcome)
+          .increment();
+      return outcome;
+    });
+  }
+
+  /** Applies an outcome the gateway reported for this payment (status check or webhook). */
+  private String applyCharge(Payment cur, GatewayCharge charge) {
+    if (charge.amount() != cur.amount()) {
+      log.error("payment {}: gateway charged {} but we sent {}; leaving it for reconciliation",
+          cur.id(), charge.amount(), cur.amount());
+      metrics.counter("ledgerline.payments.awaiting_reconciliation").increment();
+      return "AMOUNT_MISMATCH";
+    }
+    if (charge.approved()) {
+      succeed(cur, charge.chargeId());
+      return "APPLIED_SUCCEEDED";
+    }
+    failAndReverse(cur, charge.chargeId(), "declined: " + charge.declineReason());
+    return "APPLIED_REVERSED";
+  }
+
+  private static Optional<UUID> parseUuid(String s) {
+    try { return Optional.of(UUID.fromString(s)); } catch (IllegalArgumentException e) { return Optional.empty(); }
   }
 
   private void succeed(Payment p, String chargeId) {

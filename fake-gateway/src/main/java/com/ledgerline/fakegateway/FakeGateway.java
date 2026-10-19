@@ -36,9 +36,14 @@ import java.util.concurrent.atomic.AtomicInteger;
  *       a repeat returns the original charge and never charges twice.</li>
  *   <li>{@code GET /charges/{key}}: status check (200 or 404).</li>
  *   <li>{@code GET /settlements?date=YYYY-MM-DD}: the day's settlement report (by charge time, UTC).</li>
- *   <li>{@code POST /_control/config}, {@code POST /_control/reset}, {@code GET /_control/stats},
- *       {@code GET /_control/charges}: test controls.</li>
+ *   <li>{@code POST /_control/config}, {@code POST /_control/webhooks}, {@code POST /_control/reset},
+ *       {@code GET /_control/stats}, {@code GET /_control/charges}: test controls.</li>
  * </ul>
+ *
+ * When webhooks are configured, every new charge is also pushed to the webhook URL as
+ * {@code charge.approved} / {@code charge.declined}, signed Stripe-style:
+ * {@code Gateway-Signature: t=<unix seconds>,v1=<hex HMAC-SHA256(secret, t + "." + body)>}. Duplicate
+ * deliveries reuse the same event id, as a real gateway's retries would.
  *
  * Faults are chosen per {@code POST /charges} call, either from the global {@link Faults} rates or from a
  * {@code ?mode=} query parameter ({@code succeed}, {@code decline}, {@code timeout_then_succeed},
@@ -80,7 +85,18 @@ public final class FakeGateway implements AutoCloseable {
   public record Charge(String chargeId, String paymentId, String status, long amount, String currency,
                        UUID billerId, String accountRef, String declineReason, Instant chargedAt) {}
 
-  public record Stats(int submitCalls, int charges, int approved, int declined, int duplicateSubmits) {}
+  public record Stats(int submitCalls, int charges, int approved, int declined, int duplicateSubmits,
+                      int statusCalls, int webhooksSent) {}
+
+  /**
+   * Webhook delivery settings. {@code deliveries} > 1 sends the same event that many times; {@code delayMs}
+   * waits before the first delivery. A non-2xx answer is retried up to 3 times.
+   */
+  public record Webhooks(String url, String secret, long delayMs, int deliveries) {
+    public static Webhooks off() { return new Webhooks(null, null, 0, 1); }
+  }
+
+  public record WebhookEvent(String eventId, String type, Charge charge) {}
 
   private static final ObjectMapper JSON = new ObjectMapper()
       .registerModule(new JavaTimeModule())
@@ -92,6 +108,11 @@ public final class FakeGateway implements AutoCloseable {
   private final Map<String, Charge> charges = new ConcurrentHashMap<>();
   private final AtomicInteger submitCalls = new AtomicInteger();
   private final AtomicInteger duplicateSubmits = new AtomicInteger();
+  private final AtomicInteger statusCalls = new AtomicInteger();
+  private final AtomicInteger webhooksSent = new AtomicInteger();
+  private final java.net.http.HttpClient webhookClient = java.net.http.HttpClient.newBuilder()
+      .version(java.net.http.HttpClient.Version.HTTP_1_1).connectTimeout(java.time.Duration.ofSeconds(2)).build();
+  private volatile Webhooks webhooks = Webhooks.off();
   private volatile Faults faults = Faults.none();
   private volatile Random random = new Random();
 
@@ -117,7 +138,10 @@ public final class FakeGateway implements AutoCloseable {
 
   public static void main(String[] args) throws IOException {
     int port = Integer.parseInt(Objects.requireNonNullElse(System.getenv("PORT"), "8090"));
-    start(port);
+    FakeGateway gw = start(port);
+    if (System.getenv("WEBHOOK_URL") != null) {
+      gw.configureWebhooks(new Webhooks(System.getenv("WEBHOOK_URL"), System.getenv("WEBHOOK_SECRET"), 0, 1));
+    }
     System.out.println("fake-gateway listening on :" + port);
   }
 
@@ -131,11 +155,16 @@ public final class FakeGateway implements AutoCloseable {
     this.random = f.seed() == null ? new Random() : new Random(f.seed());
   }
 
+  public void configureWebhooks(Webhooks w) { this.webhooks = w; }
+
   public void reset() {
     charges.clear();
     submitCalls.set(0);
     duplicateSubmits.set(0);
+    statusCalls.set(0);
+    webhooksSent.set(0);
     configure(Faults.none());
+    configureWebhooks(Webhooks.off());
   }
 
   public List<Charge> charges() {
@@ -150,7 +179,8 @@ public final class FakeGateway implements AutoCloseable {
   public Stats stats() {
     var all = charges.values();
     int approved = (int) all.stream().filter(c -> c.status().equals("APPROVED")).count();
-    return new Stats(submitCalls.get(), all.size(), approved, all.size() - approved, duplicateSubmits.get());
+    return new Stats(submitCalls.get(), all.size(), approved, all.size() - approved, duplicateSubmits.get(),
+        statusCalls.get(), webhooksSent.get());
   }
 
   @Override public void close() { server.stop(0); }
@@ -163,6 +193,7 @@ public final class FakeGateway implements AutoCloseable {
       if (ex.getRequestMethod().equals("POST") && path.equals("/charges")) {
         submit(ex);
       } else if (ex.getRequestMethod().equals("GET") && path.startsWith("/charges/")) {
+        statusCalls.incrementAndGet();
         if (faults.statusErrors()) { send(ex, 503, Map.of("error", "status unavailable")); return; }
         Charge c = charges.get(path.substring("/charges/".length()));
         if (c == null) send(ex, 404, Map.of("error", "no such charge"));
@@ -195,7 +226,8 @@ public final class FakeGateway implements AutoCloseable {
           decline ? "DECLINED" : "APPROVED", req.amount(), req.currency(), req.billerId(), req.accountRef(),
           decline ? "card_declined" : null, Instant.now(clock));
     });
-    if (!created[0]) {
+    if (created[0]) sendWebhook(c);
+    else {
       duplicateSubmits.incrementAndGet();
       if (c.amount() != req.amount() || !c.currency().equals(req.currency())) {
         send(ex, 422, Map.of("error", "Idempotency-Key reused with a different request"));
@@ -226,11 +258,61 @@ public final class FakeGateway implements AutoCloseable {
           configure(JSON.readValue(ex.getRequestBody(), Faults.class));
           send(ex, 200, faults);
         }
+        case "POST /_control/webhooks" -> {
+          configureWebhooks(JSON.readValue(ex.getRequestBody(), Webhooks.class));
+          send(ex, 200, webhooks);
+        }
         case "POST /_control/reset" -> { reset(); send(ex, 200, stats()); }
         case "GET /_control/stats" -> send(ex, 200, stats());
         case "GET /_control/charges" -> send(ex, 200, charges());
         default -> send(ex, 404, Map.of("error", "not found"));
       }
+    }
+  }
+
+  /** Pushes the charge's outcome to the webhook URL on a background virtual thread. */
+  private void sendWebhook(Charge c) {
+    Webhooks w = webhooks;
+    if (w.url() == null) return;
+    var event = new WebhookEvent("evt_" + c.chargeId(),
+        c.status().equals("APPROVED") ? "charge.approved" : "charge.declined", c);
+    Thread.ofVirtual().start(() -> {
+      sleep(w.delayMs());
+      for (int i = 0; i < Math.max(1, w.deliveries()); i++) deliver(w, event);
+    });
+  }
+
+  private void deliver(Webhooks w, WebhookEvent event) {
+    for (int attempt = 1; attempt <= 3; attempt++) {
+      try {
+        String body = JSON.writeValueAsString(event);
+        long t = Instant.now(clock).getEpochSecond();
+        var res = webhookClient.send(java.net.http.HttpRequest.newBuilder(URI.create(w.url()))
+                .header("Content-Type", "application/json")
+                .header("Gateway-Signature", "t=" + t + ",v1=" + sign(w.secret(), t + "." + body))
+                .timeout(java.time.Duration.ofSeconds(5))
+                .POST(java.net.http.HttpRequest.BodyPublishers.ofString(body)).build(),
+            java.net.http.HttpResponse.BodyHandlers.discarding());
+        webhooksSent.incrementAndGet();
+        if (res.statusCode() / 100 == 2) return;
+      } catch (IOException e) {
+        // receiver down: retry
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        return;
+      }
+      sleep(100L * attempt);
+    }
+  }
+
+  /** Hex HMAC-SHA256, the signature scheme receivers verify. */
+  public static String sign(String secret, String payload) {
+    try {
+      var mac = javax.crypto.Mac.getInstance("HmacSHA256");
+      mac.init(new javax.crypto.spec.SecretKeySpec(secret.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
+      return java.util.HexFormat.of().formatHex(mac.doFinal(payload.getBytes(StandardCharsets.UTF_8)));
+    } catch (java.security.GeneralSecurityException e) {
+      throw new IllegalStateException(e);
     }
   }
 
