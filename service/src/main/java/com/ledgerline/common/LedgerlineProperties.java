@@ -7,7 +7,7 @@ import java.util.Map;
 
 @ConfigurationProperties("ledgerline")
 public record LedgerlineProperties(Gateway gateway, Outbox outbox, Payments payments, Rewards rewards,
-                                   Idempotency idempotency, Scheduling scheduling) {
+                                   Idempotency idempotency, Retention retention, Scheduling scheduling) {
 
   /** {@code webhookSecret} signs gateway → us webhooks; signatures older than {@code webhookTolerance} are rejected. */
   public record Gateway(String baseUrl, Duration connectTimeout, Duration readTimeout, String webhookSecret,
@@ -25,6 +25,9 @@ public record LedgerlineProperties(Gateway gateway, Outbox outbox, Payments paym
 
   /** How long a request waits for a concurrent duplicate before answering 409. */
   public record Idempotency(Duration lockTimeout) {}
+
+  /** How long bookkeeping rows are kept (see RetentionJob). */
+  public record Retention(Duration idempotencyKeys, Duration outboxDone, Duration webhookEvents) {}
 
   public record Scheduling(boolean enabled) {}
 }

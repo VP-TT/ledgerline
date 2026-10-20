@@ -40,6 +40,10 @@ ledgerline:
       USD: 1                      # 1 point = $0.01
   idempotency:
     lock-timeout: 2s
+  retention:
+    idempotency-keys: 24h         # a retry after this is treated as a new request
+    outbox-done: 7d               # DEAD events are never pruned
+    webhook-events: 30d           # must exceed the gateway's webhook redelivery window
   scheduling:
     enabled: true
 
