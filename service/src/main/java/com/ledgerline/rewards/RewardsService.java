@@ -68,6 +68,31 @@ public class RewardsService {
     });
   }
 
+  public record Clawback(long points, long shortfall, Optional<EntryRequest> entry) {}
+
+  /**
+   * Points to take back for a refund, proportional to the money refunded so far: after refunding R of a
+   * payment of A that earned P points, the user keeps floor(P × (A − R) / A). Whatever was already taken
+   * back (or recorded as shortfall) by earlier refunds is subtracted. The points account can't go below
+   * zero, so if the user has spent the points, the rest is recorded as shortfall instead.
+   *
+   * @param pointsBalance the user's current points balance, read under the account's row lock
+   */
+  public Clawback clawbackFor(UUID refundId, UUID paymentId, long paymentAmount, long refundedIncludingThis,
+                              long alreadySettledPoints, UUID pointsAccountId, long pointsBalance) {
+    long accrued = jdbc.sql("""
+        SELECT COALESCE(-SUM(p.amount), 0) FROM postings p JOIN journal_entries e ON e.id = p.entry_id
+        WHERE e.type = 'REWARD_ACCRUAL' AND e.reference_id = :pid AND p.account_id = :acct""")
+        .param("pid", paymentId).param("acct", pointsAccountId).query(Long.class).single();
+    long keep = Math.floorDiv(Math.multiplyExact(accrued, paymentAmount - refundedIncludingThis), paymentAmount);
+    long owed = Math.max(0, accrued - keep - alreadySettledPoints);
+    long take = Math.min(owed, Math.max(0, pointsBalance));
+    Optional<EntryRequest> entry = take == 0 ? Optional.empty() : Optional.of(EntryRequest.of("REWARD_CLAWBACK", refundId,
+        Posting.debit(pointsAccountId, take, Money.POINTS),
+        Posting.credit(system.rewardsExpense(), take, Money.POINTS)));
+    return new Clawback(take, owed - take, entry);
+  }
+
   public record RedeemResponse(UUID redemptionId, UUID walletId, long points, java.math.BigDecimal credited,
                                String currency, long pointsBalance, java.math.BigDecimal balance) {}
 

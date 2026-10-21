@@ -30,7 +30,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * Property: whatever sequence of top-ups, payments, gateway outcomes, redemptions and retried requests
+ * Property: whatever sequence of top-ups, payments, refunds, gateway outcomes, redemptions and retried requests
  * happens, the ledger balances. jqwik generates the sequences and, on failure, shrinks to the
  * shortest sequence that still breaks an invariant.
  *
@@ -45,6 +45,7 @@ class LedgerPropertiesIT {
   static final FakeGateway gateway = TestEnv.gateway();
   static final AtomicLong opsApplied = new AtomicLong();
   static final AtomicLong sequences = new AtomicLong();
+  static final AtomicLong refundsAccepted = new AtomicLong();
 
   // shorter gateway timeouts than the other tests: this property makes thousands of gateway calls
   static final long DELAY_MS = 150;
@@ -71,7 +72,8 @@ class LedgerPropertiesIT {
 
   @AfterContainer
   static void stopApp() {
-    System.out.printf("[property] sequences=%d operations=%d%n", sequences.get(), opsApplied.get());
+    System.out.printf("[property] sequences=%d operations=%d refunds_accepted=%d%n",
+        sequences.get(), opsApplied.get(), refundsAccepted.get());
     gateway.reset();
     if (app != null) app.close();
   }
@@ -82,6 +84,7 @@ class LedgerPropertiesIT {
     String lastPath, lastKey;
     Object lastBody;
     Api.Response lastResponse;
+    final List<Api.Response> payments = new java.util.ArrayList<>();
 
     World() {
       String user = "prop-" + UUID.randomUUID();
@@ -109,9 +112,26 @@ class LedgerPropertiesIT {
 
   record PayBill(long minor, boolean usd) implements Op {
     public void apply(World w) {
-      w.write("/v1/payments", usd
+      Api.Response r = w.write("/v1/payments", usd
           ? Api.payment(w.usd, Api.ELECTRICITY_USD, BigDecimal.valueOf(minor, 2).toPlainString(), "USD")
           : Api.payment(w.inr, Api.ELECTRICITY_INR, BigDecimal.valueOf(minor, 2).toPlainString(), "INR"));
+      if (r.status() == 202) w.payments.add(r);
+    }
+  }
+
+  /**
+   * Refund a share of one earlier payment, after letting the relay run (rejected with 422 unless the
+   * payment SUCCEEDED and the amount still fits). The refund itself is resolved by later relay runs.
+   */
+  record RefundSome(int pick, int percent) implements Op {
+    public void apply(World w) {
+      if (w.payments.isEmpty()) return;
+      relay.drain();         // like a client, refund after the payment has had a chance to complete
+      Api.Response p = w.payments.get(pick % w.payments.size());
+      BigDecimal amount = p.body().path("amount").decimalValue().multiply(BigDecimal.valueOf(percent))
+          .divide(BigDecimal.valueOf(100), 2, java.math.RoundingMode.DOWN).max(new BigDecimal("0.01"));
+      if (w.write("/v1/payments/" + p.text("id") + "/refunds", Map.of("amount", amount)).status() == 202)
+        refundsAccepted.incrementAndGet();
     }
   }
 
@@ -164,6 +184,8 @@ class LedgerPropertiesIT {
     assertThat(ledger.entriesPerReferenceAboveOne()).as("one entry per business event").isZero();
     assertThat(succeededWithoutApprovedCharge()).as("every SUCCEEDED payment was charged").isEmpty();
     assertThat(reversedButCharged()).as("no money returned for a payment the gateway charged").isEmpty();
+    assertThat(overRefunded()).as("refunds never exceed the payment").isEmpty();
+    assertThat(refundsDisagreeingWithGateway()).as("SUCCEEDED refund ⇔ gateway approved it").isEmpty();
   }
 
   @Provide
@@ -177,6 +199,8 @@ class LedgerPropertiesIT {
         Arbitraries.of(Mode.SUCCEED, Mode.DECLINE, Mode.TIMEOUT_THEN_SUCCEED, Mode.TIMEOUT_NO_CHARGE, Mode.ERROR)
             .map(ResolvePayments::new),
         Arbitraries.integers().between(1, 500).map(Redeem::new),
+        net.jqwik.api.Combinators.combine(Arbitraries.integers().between(0, 50), Arbitraries.integers().between(1, 100))
+            .as(RefundSome::new),
         Arbitraries.just(new RetrySameIdempotencyKey())
     )).list().ofMinSize(1).ofMaxSize(40);
   }
@@ -187,6 +211,23 @@ class LedgerPropertiesIT {
       var c = gateway.charge(id.toString());
       return c == null || !c.status().equals("APPROVED");
     }).toList();
+  }
+
+  List<UUID> overRefunded() {
+    return jdbc.sql("""
+        SELECT p.id FROM payments p JOIN refunds r ON r.payment_id = p.id AND r.status = 'SUCCEEDED'
+        GROUP BY p.id, p.amount HAVING SUM(r.amount) > p.amount""").query(UUID.class).list();
+  }
+
+  /** A SUCCEEDED refund must be APPROVED at the gateway; a FAILED one must not be. */
+  List<UUID> refundsDisagreeingWithGateway() {
+    var rows = jdbc.sql("SELECT id, status FROM refunds WHERE status IN ('SUCCEEDED','FAILED')")
+        .query((rs, i) -> Map.entry(rs.getObject(1, UUID.class), rs.getString(2))).list();
+    return rows.stream().filter(e -> {
+      var g = gateway.refund(e.getKey().toString());
+      boolean approved = g != null && g.status().equals("APPROVED");
+      return e.getValue().equals("SUCCEEDED") != approved;
+    }).map(Map.Entry::getKey).toList();
   }
 
   List<UUID> reversedButCharged() {

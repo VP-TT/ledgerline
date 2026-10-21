@@ -71,6 +71,47 @@ public class GatewayClient {
     }, o -> o.getClass().getSimpleName());
   }
 
+  public record RefundRequest(String paymentId, long amount, String currency) {}
+
+  /** POST /refunds, keyed by our refund id so a resubmit can't refund twice. */
+  public SubmitOutcome refund(UUID refundId, RefundRequest req) {
+    return timed("refund", () -> {
+      try {
+        return rest.post().uri("/refunds")
+            .header("Idempotency-Key", refundId.toString())
+            .contentType(MediaType.APPLICATION_JSON)
+            .body(req)
+            .exchange((request, response) -> {
+              int status = response.getStatusCode().value();
+              if (status == 200) return new SubmitOutcome.Approved(response.bodyTo(GatewayRefund.class).refundId());
+              if (status == 402) {
+                GatewayRefund r = response.bodyTo(GatewayRefund.class);
+                return new SubmitOutcome.Declined(r.refundId(), r.declineReason());
+              }
+              if (status >= 500) return new SubmitOutcome.Unknown("gateway " + status);
+              throw new IllegalStateException("gateway rejected refund request: " + status);
+            });
+      } catch (ResourceAccessException timeoutOrIo) {
+        return new SubmitOutcome.Unknown(rootMessage(timeoutOrIo));
+      }
+    }, o -> o.getClass().getSimpleName());
+  }
+
+  public RefundLookup refundStatus(UUID refundId) {
+    return timed("refund_status", () -> {
+      try {
+        return rest.get().uri("/refunds/{id}", refundId).exchange((request, response) -> {
+          int status = response.getStatusCode().value();
+          if (status == 200) return new RefundLookup.Found(response.bodyTo(GatewayRefund.class));
+          if (status == 404) return new RefundLookup.NotFound();
+          return new RefundLookup.Unknown("gateway " + status);
+        });
+      } catch (ResourceAccessException timeoutOrIo) {
+        return new RefundLookup.Unknown(rootMessage(timeoutOrIo));
+      }
+    }, o -> o.getClass().getSimpleName());
+  }
+
   public List<GatewayCharge> settlements(LocalDate day) {
     try {
       return rest.get().uri("/settlements?date={d}", day).retrieve()

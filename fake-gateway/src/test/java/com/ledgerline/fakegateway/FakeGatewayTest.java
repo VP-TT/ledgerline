@@ -45,7 +45,7 @@ class FakeGatewayTest {
     var second = charge("p1", "", Duration.ofSeconds(2));
     assertThat(first.statusCode()).isEqualTo(200);
     assertThat(second.body()).isEqualTo(first.body());
-    assertThat(gw.stats()).isEqualTo(new FakeGateway.Stats(2, 1, 1, 0, 1, 0, 0));
+    assertThat(gw.stats()).isEqualTo(new FakeGateway.Stats(2, 1, 1, 0, 1, 0, 0, 0));
   }
 
   @Test void declineIsRecordedAndSticky() throws Exception {
@@ -92,6 +92,25 @@ class FakeGatewayTest {
     } finally {
       receiver.stop(0);
     }
+  }
+
+  HttpResponse<String> refund(String key, String paymentId, long amount) throws Exception {
+    return http.send(HttpRequest.newBuilder(URI.create(gw.baseUrl() + "/refunds"))
+        .header("Idempotency-Key", key).header("Content-Type", "application/json")
+        .POST(HttpRequest.BodyPublishers.ofString(
+            "{\"paymentId\":\"" + paymentId + "\",\"amount\":" + amount + ",\"currency\":\"INR\"}")).build(),
+        HttpResponse.BodyHandlers.ofString());
+  }
+
+  @Test void refundsNeverExceedTheChargeAndAreIdempotent() throws Exception {
+    charge("p7", "", Duration.ofSeconds(2));                       // 5000
+    assertThat(refund("r1", "p7", 3000).statusCode()).isEqualTo(200);
+    assertThat(refund("r1", "p7", 3000).statusCode()).as("same key: same refund").isEqualTo(200);
+    assertThat(refund("r2", "p7", 2001).statusCode()).as("would exceed 5000").isEqualTo(402);
+    assertThat(refund("r3", "p7", 2000).statusCode()).isEqualTo(200);
+    assertThat(refund("r4", "nope", 1).statusCode()).isEqualTo(402);
+    assertThat(gw.refund("r2").declineReason()).isEqualTo("exceeds_charge");
+    assertThat(gw.stats().refunds()).isEqualTo(4);
   }
 
   @Test void settlementReportListsTodaysCharges() throws Exception {

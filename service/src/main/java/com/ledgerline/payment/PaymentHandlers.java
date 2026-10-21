@@ -22,6 +22,15 @@ public class PaymentHandlers {
     return handler(PaymentService.STATUS_CHECK_EVENT, processor::checkStatus);
   }
 
+  @Bean OutboxHandler refundSubmitHandler(com.ledgerline.refund.RefundProcessor processor) {
+    return handler(com.ledgerline.refund.RefundService.SUBMIT_EVENT, processor::submit);
+  }
+
+  @Bean OutboxHandler refundStatusCheckHandler(com.ledgerline.refund.RefundProcessor processor) {
+    return handler(com.ledgerline.refund.RefundService.STATUS_CHECK_EVENT, processor::checkStatus);
+  }
+
+  /** Wraps an action so that losing a race to another worker counts as done, not as a failure. */
   private static OutboxHandler handler(String type, Consumer<UUID> action) {
     return new OutboxHandler() {
       @Override public String eventType() { return type; }

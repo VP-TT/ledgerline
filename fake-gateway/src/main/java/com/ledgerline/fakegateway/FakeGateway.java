@@ -36,6 +36,8 @@ import java.util.concurrent.atomic.AtomicInteger;
  *       a repeat returns the original charge and never charges twice.</li>
  *   <li>{@code GET /charges/{key}}: status check (200 or 404).</li>
  *   <li>{@code GET /settlements?date=YYYY-MM-DD}: the day's settlement report (by charge time, UTC).</li>
+ *   <li>{@code POST /refunds} with an {@code Idempotency-Key}: refund part or all of an approved charge
+ *       (declined if it would refund more than was charged); {@code GET /refunds/{key}}: status check.</li>
  *   <li>{@code POST /_control/config}, {@code POST /_control/webhooks}, {@code POST /_control/reset},
  *       {@code GET /_control/stats}, {@code GET /_control/charges}: test controls.</li>
  * </ul>
@@ -86,7 +88,12 @@ public final class FakeGateway implements AutoCloseable {
                        UUID billerId, String accountRef, String declineReason, Instant chargedAt) {}
 
   public record Stats(int submitCalls, int charges, int approved, int declined, int duplicateSubmits,
-                      int statusCalls, int webhooksSent) {}
+                      int statusCalls, int webhooksSent, int refunds) {}
+
+  public record RefundRequest(String paymentId, long amount, String currency) {}
+
+  public record Refund(String refundId, String key, String paymentId, String status, long amount, String currency,
+                       String declineReason, Instant refundedAt) {}
 
   /**
    * Webhook delivery settings. {@code deliveries} > 1 sends the same event that many times; {@code delayMs}
@@ -106,6 +113,7 @@ public final class FakeGateway implements AutoCloseable {
   private final HttpServer server;
   private final Clock clock;
   private final Map<String, Charge> charges = new ConcurrentHashMap<>();
+  private final Map<String, Refund> refunds = new ConcurrentHashMap<>();
   private final AtomicInteger submitCalls = new AtomicInteger();
   private final AtomicInteger duplicateSubmits = new AtomicInteger();
   private final AtomicInteger statusCalls = new AtomicInteger();
@@ -131,6 +139,7 @@ public final class FakeGateway implements AutoCloseable {
     http.setExecutor(Executors.newVirtualThreadPerTaskExecutor());
     http.createContext("/charges", gw::charges);
     http.createContext("/settlements", gw::settlements);
+    http.createContext("/refunds", gw::refunds);
     http.createContext("/_control", gw::control);
     http.start();
     return gw;
@@ -159,6 +168,7 @@ public final class FakeGateway implements AutoCloseable {
 
   public void reset() {
     charges.clear();
+    refunds.clear();
     submitCalls.set(0);
     duplicateSubmits.set(0);
     statusCalls.set(0);
@@ -180,7 +190,7 @@ public final class FakeGateway implements AutoCloseable {
     var all = charges.values();
     int approved = (int) all.stream().filter(c -> c.status().equals("APPROVED")).count();
     return new Stats(submitCalls.get(), all.size(), approved, all.size() - approved, duplicateSubmits.get(),
-        statusCalls.get(), webhooksSent.get());
+        statusCalls.get(), webhooksSent.get(), refunds.size());
   }
 
   @Override public void close() { server.stop(0); }
@@ -236,6 +246,56 @@ public final class FakeGateway implements AutoCloseable {
     }
     if (mode == Mode.TIMEOUT_THEN_SUCCEED) sleep(faults.delayMs());   // charged, but the client gives up
     send(ex, c.status().equals("APPROVED") ? 200 : 402, c);
+  }
+
+  public List<Refund> refunds() {
+    return refunds.values().stream().sorted(Comparator.comparing(Refund::refundedAt)).toList();
+  }
+
+  public Refund refund(String key) { return refunds.get(key); }
+
+  private void refunds(HttpExchange ex) throws IOException {
+    try (ex) {
+      String path = ex.getRequestURI().getPath();
+      if (ex.getRequestMethod().equals("GET") && path.startsWith("/refunds/")) {
+        statusCalls.incrementAndGet();
+        if (faults.statusErrors()) { send(ex, 503, Map.of("error", "status unavailable")); return; }
+        Refund r = refunds.get(path.substring("/refunds/".length()));
+        if (r == null) send(ex, 404, Map.of("error", "no such refund"));
+        else send(ex, 200, r);
+        return;
+      }
+      if (!ex.getRequestMethod().equals("POST") || !path.equals("/refunds")) { send(ex, 404, Map.of("error", "not found")); return; }
+
+      String key = ex.getRequestHeaders().getFirst("Idempotency-Key");
+      if (key == null || key.isBlank()) { send(ex, 400, Map.of("error", "Idempotency-Key required")); return; }
+      RefundRequest req = JSON.readValue(ex.getRequestBody(), RefundRequest.class);
+      Mode mode = pickMode(query(ex.getRequestURI()).get("mode"));
+      switch (mode) {
+        case ERROR -> { send(ex, 503, Map.of("error", "upstream unavailable")); return; }
+        case TIMEOUT_NO_CHARGE -> { sleep(faults.delayMs()); send(ex, 504, Map.of("error", "dropped")); return; }
+        case SLOW -> sleep(faults.delayMs());
+        default -> { }
+      }
+      Refund r;
+      synchronized (refunds) {      // the "never refund more than was charged" check must not race itself
+        r = refunds.get(key);
+        if (r == null) {
+          Charge c = charges.get(req.paymentId());
+          long already = refunds.values().stream()
+              .filter(x -> x.paymentId().equals(req.paymentId()) && x.status().equals("APPROVED"))
+              .mapToLong(Refund::amount).sum();
+          String reason = mode == Mode.DECLINE ? "refund_declined"
+              : c == null || !c.status().equals("APPROVED") ? "no_approved_charge"
+              : already + req.amount() > c.amount() ? "exceeds_charge" : null;
+          r = new Refund("re_" + UUID.randomUUID().toString().replace("-", "").substring(0, 20), key, req.paymentId(),
+              reason == null ? "APPROVED" : "DECLINED", req.amount(), req.currency(), reason, Instant.now(clock));
+          refunds.put(key, r);
+        }
+      }
+      if (mode == Mode.TIMEOUT_THEN_SUCCEED) sleep(faults.delayMs());
+      send(ex, r.status().equals("APPROVED") ? 200 : 402, r);
+    }
   }
 
   private void settlements(HttpExchange ex) throws IOException {
